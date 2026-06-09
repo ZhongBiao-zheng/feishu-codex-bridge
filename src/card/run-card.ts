@@ -173,8 +173,15 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
 
   // 落地 #7：群聊里干净完成且有答复时，在卡片最下方 @ 本轮提问人（其可能已离开话题）。
   // 仅群聊：p2p 私聊 @ 唯一对话方无意义。requesterOpenId 由桥记录（= 触发消息 senderId），
-  // markdown 元素原生渲染 <at>。
-  if (state.terminal === 'done' && answer && rc.requesterOpenId && rc.chatType === 'group') {
+  // markdown 元素原生渲染 <at>。去重：答复正文若已 @ 提问人（agent 现已知其 open_id，
+  // doctrine 要求它 @ 回提问者），就不再重复追加，避免提问人收到两个 @。
+  if (
+    state.terminal === 'done' &&
+    answer &&
+    rc.requesterOpenId &&
+    rc.chatType === 'group' &&
+    !answer.includes(`<at id=${rc.requesterOpenId}`)
+  ) {
     elements.push(md(`<at id=${rc.requesterOpenId}></at>`));
   }
 

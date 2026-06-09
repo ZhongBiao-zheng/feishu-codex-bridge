@@ -235,4 +235,14 @@ describe('terminal @ requester (group only)', () => {
     ]));
     expect(JSON.stringify(bodyEls(buildRunCard({ rs, requesterOpenId: 'ou_x', chatType: 'group' })))).not.toContain('<at id=');
   });
+
+  it('does NOT add a second @ when the answer already mentions the requester', () => {
+    const rs = run([
+      { type: 'text_delta', itemId: 'a', delta: '已处理完 <at id=ou_abcd1234></at>' },
+      { type: 'done', turnId: 't1' },
+    ]);
+    const json = JSON.stringify(bodyEls(buildRunCard({ rs, requesterOpenId: 'ou_abcd1234', chatType: 'group' })));
+    const count = (json.match(/<at id=ou_abcd1234/g) ?? []).length;
+    expect(count).toBe(1);
+  });
 });

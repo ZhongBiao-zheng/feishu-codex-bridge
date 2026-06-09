@@ -576,9 +576,13 @@ export function createOrchestrator(
       const quoted = await fetchQuotedMessage(channel, msg.replyToMessageId);
       body = weaveQuote(body, quoted);
     }
-    // Identity weave (outermost within ingestContext): fold WHO sent this turn so
-    // codex can match the roster (approve-gate) and @ them back. Covers both the
-    // first-turn (startReservedRun) and mid-turn (handleTurn) paths.
+    // Identity weave — the outermost weave applied INSIDE ingestContext, so the
+    // sender block sits above the quote/file blocks woven here. (On the first
+    // turn, startReservedRun later prepends weaveThreadHistory ABOVE this, so the
+    // sender block isn't necessarily the topmost line — codex reads the whole
+    // prompt regardless.) Folds WHO sent this turn so codex can match the roster
+    // (approve-gate) and @ them back. Covers both the first-turn (startReservedRun)
+    // and mid-turn (handleTurn) paths.
     body = weaveSender(body, msg);
     return body;
   }
