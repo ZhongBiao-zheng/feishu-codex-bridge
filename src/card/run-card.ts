@@ -55,6 +55,9 @@ export interface RunCardState {
   threadId?: string;
   /** who started this run — only they (or an admin) may ⏹ it (design §5) */
   requesterOpenId?: string;
+  /** chat type of the triggering message; the bridge only auto-@s the requester
+   * in 'group' chats (in a 1:1 p2p there's no point @-ing the only other party). */
+  chatType?: 'p2p' | 'group';
   /** drop tool blocks from the render (pref) */
   showTools?: boolean;
   /** `![](src) → image_key` for the final answer's images (populated at terminal
@@ -166,6 +169,13 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
     elements.push(noteMd(`⚠️ agent 失败：${state.errorMsg}`));
   } else if (state.terminal === 'done' && !answer) {
     elements.push(noteMd('_（未返回内容）_'));
+  }
+
+  // 落地 #7：群聊里干净完成且有答复时，在卡片最下方 @ 本轮提问人（其可能已离开话题）。
+  // 仅群聊：p2p 私聊 @ 唯一对话方无意义。requesterOpenId 由桥记录（= 触发消息 senderId），
+  // markdown 元素原生渲染 <at>。
+  if (state.terminal === 'done' && answer && rc.requesterOpenId && rc.chatType === 'group') {
+    elements.push(md(`<at id=${rc.requesterOpenId}></at>`));
   }
 
   return elements;

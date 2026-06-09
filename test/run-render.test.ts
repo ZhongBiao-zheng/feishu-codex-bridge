@@ -197,3 +197,42 @@ describe('buildRunCard — terminal collapse', () => {
     expect(JSON.stringify(els)).toContain('未返回内容');
   });
 });
+
+describe('terminal @ requester (group only)', () => {
+  it('@s the requester at the bottom of a finished group reply with an answer', () => {
+    const rs = run([
+      { type: 'text_delta', itemId: 'a', delta: '已处理完，请验收' },
+      { type: 'done', turnId: 't1' },
+    ]);
+    const els = bodyEls(buildRunCard({ rs, requesterOpenId: 'ou_abcd1234', chatType: 'group' }));
+    expect(JSON.stringify(els[els.length - 1])).toContain('<at id=ou_abcd1234></at>');
+  });
+
+  it('does NOT @ in a p2p chat (no point @-ing the only other party)', () => {
+    const rs = run([
+      { type: 'text_delta', itemId: 'a', delta: '好了' },
+      { type: 'done', turnId: 't1' },
+    ]);
+    expect(JSON.stringify(bodyEls(buildRunCard({ rs, requesterOpenId: 'ou_x', chatType: 'p2p' })))).not.toContain('<at id=');
+  });
+
+  it('does NOT @ when there is no requesterOpenId', () => {
+    const rs = run([{ type: 'text_delta', itemId: 'a', delta: 'hi' }, { type: 'done', turnId: 't1' }]);
+    expect(JSON.stringify(bodyEls(buildRunCard({ rs, chatType: 'group' })))).not.toContain('<at id=');
+  });
+
+  it('does NOT @ when the run errored (no clean answer)', () => {
+    const rs = run([
+      { type: 'text_delta', itemId: 'a', delta: 'partial' },
+      { type: 'error', message: 'boom', willRetry: false },
+    ]);
+    expect(JSON.stringify(bodyEls(buildRunCard({ rs, requesterOpenId: 'ou_x', chatType: 'group' })))).not.toContain('<at id=');
+  });
+
+  it('does NOT @ when interrupted, even with a partial answer', () => {
+    const rs = markInterrupted(run([
+      { type: 'text_delta', itemId: 'a', delta: '写到一半' },
+    ]));
+    expect(JSON.stringify(bodyEls(buildRunCard({ rs, requesterOpenId: 'ou_x', chatType: 'group' })))).not.toContain('<at id=');
+  });
+});
