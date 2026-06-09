@@ -112,6 +112,7 @@ import {
   fetchQuotedMessage,
   fetchThreadContext,
   weaveQuote,
+  weaveSender,
   weaveThreadHistory,
 } from './context-weave';
 import {
@@ -575,6 +576,10 @@ export function createOrchestrator(
       const quoted = await fetchQuotedMessage(channel, msg.replyToMessageId);
       body = weaveQuote(body, quoted);
     }
+    // Identity weave (outermost within ingestContext): fold WHO sent this turn so
+    // codex can match the roster (approve-gate) and @ them back. Covers both the
+    // first-turn (startReservedRun) and mid-turn (handleTurn) paths.
+    body = weaveSender(body, msg);
     return body;
   }
 
