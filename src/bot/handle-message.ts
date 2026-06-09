@@ -112,6 +112,7 @@ import {
   fetchQuotedMessage,
   fetchThreadContext,
   weaveQuote,
+  weaveSender,
   weaveThreadHistory,
 } from './context-weave';
 import {
@@ -575,6 +576,14 @@ export function createOrchestrator(
       const quoted = await fetchQuotedMessage(channel, msg.replyToMessageId);
       body = weaveQuote(body, quoted);
     }
+    // Identity weave — the outermost weave applied INSIDE ingestContext, so the
+    // sender block sits above the quote/file blocks woven here. (On the first
+    // turn, startReservedRun later prepends weaveThreadHistory ABOVE this, so the
+    // sender block isn't necessarily the topmost line — codex reads the whole
+    // prompt regardless.) Folds WHO sent this turn so codex can match the roster
+    // (approve-gate) and @ them back. Covers both the first-turn (startReservedRun)
+    // and mid-turn (handleTurn) paths.
+    body = weaveSender(body, msg);
     return body;
   }
 
@@ -729,6 +738,7 @@ export function createOrchestrator(
             images,
             knownThreadId: sessionKey,
             requesterOpenId: msg.senderId,
+            chatType: msg.chatType,
           },
           reaction,
         );
@@ -864,6 +874,7 @@ export function createOrchestrator(
           cwd,
           summary: stripFileTokens(text).slice(0, 80) || '(空)',
           requesterOpenId: msg.senderId,
+          chatType: msg.chatType,
           roleSuffix: perm.roleSuffix,
         },
         reaction,
@@ -1708,6 +1719,8 @@ export function createOrchestrator(
     summary?: string;
     /** who triggered this run (for ⏹/⚙️ ownership gating) */
     requesterOpenId?: string;
+    /** chat type of the trigger (only 'group' gets the auto-@ requester footer). */
+    chatType?: 'p2p' | 'group';
     /** single-session group: reply by quoting (no reply_in_thread / topic). */
     flat?: boolean;
     /** when admin/guest tiers are split: 'admin'|'guest' to namespace the
@@ -1782,6 +1795,7 @@ export function createOrchestrator(
         const rc: RunCardState = {
           rs: render.snapshot(),
           requesterOpenId: opts.requesterOpenId,
+          chatType: opts.chatType,
           showTools: render.showTools,
         };
 
