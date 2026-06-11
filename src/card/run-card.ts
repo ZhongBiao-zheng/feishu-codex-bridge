@@ -19,6 +19,12 @@ import {
 } from './run-state';
 import { renderRichText } from './markdown-render';
 import { toolBodyMd, toolHeaderText } from './tool-render';
+import { runCardGauge } from './context-gauge';
+
+/** The context-usage gauge line, only at/above the warn tier (else null). */
+function gaugeEl(state: RunState): CardElement | null {
+  return state.usage ? runCardGauge(state.usage.used, state.usage.window) : null;
+}
 
 /** Action ids for the in-topic run card. */
 export const RC = {
@@ -121,6 +127,10 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
 
   if (state.footer) elements.push(footerStatus(state.footer));
   if (rc.cardKey) elements.push(actions([button('⏹ 终止', { a: RC.stop, m: rc.cardKey }, 'danger')]));
+  // Context-usage gauge rides at the very bottom as a footnote (only at/above
+  // the warn tier) so it never pushes the answer down.
+  const gauge = gaugeEl(state);
+  if (gauge) elements.push(gauge);
   return elements;
 }
 
@@ -164,12 +174,18 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
   if (state.terminal === 'interrupted') {
     elements.push(noteMd('_⏹ 已被中断_'));
   } else if (state.terminal === 'idle_timeout') {
-    elements.push(noteMd(`_⏱ ${state.idleTimeoutMinutes ?? 0} 分钟无响应，已自动终止_`));
+    const s = state.idleTimeoutSeconds ?? 0;
+    const idleLabel = s > 0 && s % 60 === 0 ? `${s / 60} 分钟` : `${s} 秒`;
+    elements.push(noteMd(`_⏱ ${idleLabel}无响应，已自动终止_`));
   } else if (state.terminal === 'error' && state.errorMsg) {
     elements.push(noteMd(`⚠️ agent 失败：${state.errorMsg}`));
   } else if (state.terminal === 'done' && !answer) {
     elements.push(noteMd('_（未返回内容）_'));
   }
+
+  // Context-usage gauge as the closing footnote (only at/above the warn tier).
+  const gauge = gaugeEl(state);
+  if (gauge) elements.push(gauge);
 
   // 落地 #7：群聊里干净完成且有答复时，在卡片最下方 @ 本轮提问人（其可能已离开话题）。
   // 仅群聊：p2p 私聊 @ 唯一对话方无意义。requesterOpenId 由桥记录（= 触发消息 senderId），

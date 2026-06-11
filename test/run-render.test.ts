@@ -180,10 +180,16 @@ describe('buildRunCard — terminal collapse', () => {
     expect(json).toContain('agent 失败：boom');
   });
 
-  it('shows the idle-timeout note', () => {
+  it('shows the idle-timeout note in minutes for round values', () => {
     let rs = run([{ type: 'tool_use', itemId: 't1', title: 'hang' }]);
-    rs = markIdleTimeout(rs, 7);
+    rs = markIdleTimeout(rs, 420);
     expect(JSON.stringify(bodyEls(buildRunCard({ rs })))).toContain('7 分钟无响应');
+  });
+
+  it('shows the idle-timeout note in seconds for non-round values', () => {
+    let rs = run([{ type: 'tool_use', itemId: 't1', title: 'hang' }]);
+    rs = markIdleTimeout(rs, 90);
+    expect(JSON.stringify(bodyEls(buildRunCard({ rs })))).toContain('90 秒无响应');
   });
 
   it('reports no content when a done run produced no text', () => {
@@ -244,5 +250,47 @@ describe('terminal @ requester (group only)', () => {
     const json = JSON.stringify(bodyEls(buildRunCard({ rs, requesterOpenId: 'ou_abcd1234', chatType: 'group' })));
     const count = (json.match(/<at id=ou_abcd1234/g) ?? []).length;
     expect(count).toBe(1);
+  });
+});
+
+describe('context usage gauge', () => {
+  it('stores the latest usage from context_usage events', () => {
+    const rs = run([
+      { type: 'context_usage', usedTokens: 100, contextWindow: 8192 },
+      { type: 'context_usage', usedTokens: 4096, contextWindow: 8192 },
+    ]);
+    expect(rs.usage).toEqual({ used: 4096, window: 8192 });
+  });
+
+  it('keeps the run card clean below the threshold', () => {
+    const rs = run([{ type: 'context_usage', usedTokens: 100, contextWindow: 8192 }]);
+    expect(JSON.stringify(buildRunCard({ rs }))).not.toContain('上下文');
+  });
+
+  it('surfaces the gauge + /compact nudge above the threshold', () => {
+    const rs = run([{ type: 'context_usage', usedTokens: 8000, contextWindow: 8192 }]);
+    const json = JSON.stringify(buildRunCard({ rs }));
+    expect(json).toContain('上下文');
+    expect(json).toContain('/compact');
+  });
+
+  it('does not surface the gauge when the window is unknown', () => {
+    const rs = run([{ type: 'context_usage', usedTokens: 999999, contextWindow: null }]);
+    expect(JSON.stringify(buildRunCard({ rs }))).not.toContain('上下文');
+  });
+
+  it('renders the gauge as the closing footnote, below the answer', () => {
+    const rs = run([
+      { type: 'context_usage', usedTokens: 8000, contextWindow: 8192 },
+      { type: 'text', itemId: 'a', text: 'FINAL ANSWER' },
+      { type: 'done', turnId: 'turn-1' },
+    ]);
+    const els = bodyEls(buildRunCard({ rs }));
+    const last = els[els.length - 1]!;
+    expect(JSON.stringify(last)).toContain('上下文');
+    // the answer must come before the gauge footnote
+    const answerIdx = els.findIndex((e) => JSON.stringify(e).includes('FINAL ANSWER'));
+    expect(answerIdx).toBeGreaterThanOrEqual(0);
+    expect(answerIdx).toBeLessThan(els.length - 1);
   });
 });

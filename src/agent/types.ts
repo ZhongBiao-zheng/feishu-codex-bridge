@@ -102,6 +102,13 @@ export type AgentEvent =
   | { type: 'tool_use'; itemId: string; title: string; detail?: string }
   | { type: 'tool_result'; itemId: string; output?: string; exitCode?: number | null }
   | { type: 'usage'; inputTokens?: number; outputTokens?: number }
+  // Context-window usage for this thread (from thread/tokenUsage/updated). Drives
+  // the run card's threshold gauge + the /context command. `contextWindow` is the
+  // model's total window (null when codex doesn't report one → percent unknown).
+  | { type: 'context_usage'; usedTokens: number; contextWindow: number | null }
+  // codex compacted the thread's history (thread/compacted). Auto-compaction
+  // surfaces a notice; a manual /compact is suppressed (see handle-message).
+  | { type: 'context_compacted' }
   | { type: 'done'; turnId: string }
   | { type: 'error'; message: string; willRetry: boolean };
 
@@ -109,6 +116,14 @@ export interface AgentRun {
   events: AsyncIterable<AgentEvent>;
   /** current turn id, available after `turn_started` */
   turnId(): string | undefined;
+}
+
+/** Outcome of a manual {@link AgentThread.compact}. `compacted` is true iff codex
+ * emitted a thread/compacted notice (false ⇒ nothing to compact). `usage` is the
+ * post-compaction token usage when codex reported one, else null. */
+export interface CompactResult {
+  compacted: boolean;
+  usage: { usedTokens: number; contextWindow: number | null } | null;
 }
 
 /** Per-turn overrides (apply to this turn and persist for subsequent turns). */
@@ -125,6 +140,10 @@ export interface AgentThread {
   steer(input: AgentInput, expectedTurnId: string): Promise<void>;
   /** interrupt the in-flight turn (watchdog 中止) */
   abort(turnId: string): Promise<void>;
+  /** Summarize the thread's history to free context (thread/compact/start) and
+   * resolve only once it actually finishes — compaction runs as a background
+   * turn, so this drains the event stream to turn/completed. */
+  compact(): Promise<CompactResult>;
   /** terminate the underlying app-server process */
   close(): Promise<void>;
 }
@@ -138,6 +157,10 @@ export interface StartThreadOptions {
   /** let the sandboxed agent's shell reach the network (qa/write only; full is
    * always networked). Default false. */
   network?: boolean;
+  /** codex's built-in auto-compaction (on by default). `false` disables it by
+   * pushing the auto-compact token limit past any real usage. Undefined → leave
+   * codex's default (on). */
+  autoCompact?: boolean;
 }
 
 export interface ResumeThreadOptions extends StartThreadOptions {
