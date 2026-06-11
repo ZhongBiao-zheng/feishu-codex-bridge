@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { effectiveGuestMode, effectiveMode, turnTier } from '../src/project/registry';
-import { sandboxParams } from '../src/agent/codex-appserver/backend';
-import { buildPermissionCard, buildProjectSettingsCard } from '../src/card/dm-cards';
+import { sandboxParams, withAutoCompact } from '../src/agent/codex-appserver/backend';
+import { buildGroupSettingsCard, buildPermissionCard, buildProjectSettingsCard } from '../src/card/dm-cards';
 
 describe('effectiveMode', () => {
   it('defaults missing mode to full (legacy data unaffected)', () => {
@@ -94,6 +94,43 @@ describe('sandboxParams', () => {
   });
 });
 
+describe('group settings card', () => {
+  it('renders the auto-compact toggle, defaulting to on', () => {
+    const json = JSON.stringify(buildGroupSettingsCard({ name: 'P', kind: 'multi', origin: 'created' }));
+    expect(json).toContain('gs.autoCompact');
+    expect(json).toContain('自动压缩');
+  });
+  it('reflects an explicit off setting', () => {
+    const json = JSON.stringify(
+      buildGroupSettingsCard({ name: 'P', kind: 'multi', origin: 'created', autoCompact: false }),
+    );
+    // the 'off' option button is primary-selected when autoCompact is false
+    expect(json).toContain('gs.autoCompact');
+  });
+});
+
+describe('withAutoCompact', () => {
+  it('leaves params untouched when auto-compact is on (true/undefined)', () => {
+    const full = { sandbox: 'danger-full-access' };
+    expect(withAutoCompact(full, undefined)).toEqual(full);
+    expect(withAutoCompact(full, true)).toEqual(full);
+  });
+
+  it('injects a disable limit into a fresh config (full mode keeps sandbox)', () => {
+    const out = withAutoCompact({ sandbox: 'danger-full-access' }, false) as any;
+    expect(out.sandbox).toBe('danger-full-access');
+    expect(out.config.model_auto_compact_token_limit).toBeGreaterThan(100_000_000);
+  });
+
+  it('merges the disable limit into an existing config without clobbering permissions', () => {
+    const qa = { config: { default_permissions: 'feishu', permissions: { feishu: {} } } };
+    const out = withAutoCompact(qa, false) as any;
+    expect(out.config.default_permissions).toBe('feishu');
+    expect(out.config.permissions.feishu).toBeDefined();
+    expect(out.config.model_auto_compact_token_limit).toBeGreaterThan(100_000_000);
+  });
+});
+
 describe('permission cards', () => {
   // The project settings card opens the 🔐 权限 form sub-card (buildPermissionCard);
   // the tier choice is a dropdown (select_static in a form), not live buttons.
@@ -105,6 +142,14 @@ describe('permission cards', () => {
     expect(json).toContain('"n":"P"');
     expect(json).toContain('管理员'); // split summary mentions both roles
     expect(json).toContain('其他人');
+  });
+
+  it('project settings card carries the auto-compact toggle (project-scoped)', () => {
+    const json = JSON.stringify(
+      buildProjectSettingsCard({ name: 'P', cwd: '/x', kind: 'multi', origin: 'created', mode: 'full', guestMode: 'qa', network: false }),
+    );
+    expect(json).toContain('dm.proj.autoCompact');
+    expect(json).toContain('自动压缩');
   });
 
   it('permission form has admin + guest tier dropdowns, network, submit, and pre-selects current tiers', () => {

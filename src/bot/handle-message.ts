@@ -10,6 +10,8 @@ import {
   isChatAllowed,
   isUserAllowedInProject,
   resolveOwner,
+  RUN_IDLE_TIMEOUT_MAX_SEC,
+  RUN_IDLE_TIMEOUT_MIN_SEC,
   secretKeyForApp,
   type AppAccess,
   type AppConfig,
@@ -39,6 +41,13 @@ import { ANSWER_EID, buildRunCard, buildRunCardPlain, RC, type RunCardState } fr
 import { RunCardStream } from '../card/run-card-stream';
 import { buildCleanCard, extractCardFences } from '../card/markdown-render';
 import { imageSources, uploadOutboundImages } from '../card/outbound-images';
+import {
+  buildAutoCompactCard,
+  buildCompactFailedCard,
+  buildCompactedCard,
+  buildCompactingCard,
+  buildContextCard,
+} from '../card/context-gauge';
 import { log, withTrace } from '../core/logger';
 import {
   buildAddAdminCard,
@@ -53,10 +62,12 @@ import {
   buildNewProjectFormCard,
   buildPermissionCard,
   buildProjectListCard,
+  buildProjectTopicsCard,
   buildProjectSettingsCard,
   buildRmConfirmCard,
   buildSettingsCard,
   buildUpdateCard,
+  buildWatchdogCustomCard,
   DM,
   GS,
   type DoctorInfo,
@@ -287,7 +298,10 @@ export function createOrchestrator(
   /** Per-doc serialization for comment runs (see {@link withDocLock}). */
   const docLocks = new Map<string, Promise<void>>();
   const sema = new Semaphore(getMaxConcurrentRuns(cfg));
-  const idleMs = getRunIdleTimeoutMs(cfg) ?? 0;
+  // Read live per run (not frozen at startup) so the settings card's change to
+  // the idle timeout applies immediately to every group/thread — no daemon
+  // restart. `cfg` is the same object `applyPref` mutates, so this sees edits.
+  const currentIdleMs = (): number => getRunIdleTimeoutMs(cfg) ?? 0;
   // pendingPolicy is read per-message (settings card can change it live)
   /** pending /resume cards, keyed by the card's messageId */
   const resumePending = new Map<string, ResumeCardState>();
@@ -302,6 +316,9 @@ export function createOrchestrator(
   const runStreams = new Map<string, RunCardStream>();
   /** the latest settings-bearing run card per topic thread */
   const lastRunCard = new Map<string, string>();
+  /** latest context usage per session (sessionKey → tokens), for `/context`.
+   * Fed from context_usage events in the run loop; keyed like topicThreadId. */
+  const lastUsage = new Map<string, { used: number; window: number | null }>();
   let modelsCache: ModelInfo[] | null = null;
 
   async function listModels(): Promise<ModelInfo[]> {
@@ -430,6 +447,14 @@ export function createOrchestrator(
         await postModelCard(msg, ts.sessionKey);
         return;
       }
+      if (cmd === 'compact') {
+        await runCompact(msg, ts.sessionKey, false, ts);
+        return;
+      }
+      if (cmd === 'context') {
+        await postContextCard(msg, ts.sessionKey, false);
+        return;
+      }
       handleTurn(msg, text, ts.sessionKey, true, project, ts);
       return;
     }
@@ -445,6 +470,14 @@ export function createOrchestrator(
       const ts = turnSession(msg.threadId, project, msg.senderId);
       if (cmd === 'model') {
         await postModelCard(msg, ts.sessionKey);
+        return;
+      }
+      if (cmd === 'compact') {
+        await runCompact(msg, ts.sessionKey, true, ts);
+        return;
+      }
+      if (cmd === 'context') {
+        await postContextCard(msg, ts.sessionKey, true);
         return;
       }
       handleTurn(msg, text, ts.sessionKey, false, project, ts);
@@ -465,20 +498,27 @@ export function createOrchestrator(
       await postGroupSettings(msg, project);
       return;
     }
-    if (cmd === 'model') {
+    if (cmd === 'model' || cmd === 'compact' || cmd === 'context') {
       await channel
-        .send(msg.chatId, { markdown: '`/model` 需要在话题里使用（先 @我 开个话题）。' }, { replyTo: msg.messageId })
+        .send(msg.chatId, { markdown: `\`/${cmd}\` 需要在话题里使用（先 @我 开个话题）。` }, { replyTo: msg.messageId })
         .catch(() => undefined);
       return;
     }
     startTopicDirectly(msg, text, project);
   };
 
-  /** Parse a leading slash command (`/resume`, `/model`, `/settings`); null otherwise. */
-  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | null {
+  /** Parse a leading slash command; null otherwise. */
+  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | 'compact' | 'context' | null {
     const m = /^\/(\w+)/.exec(text);
     const name = m?.[1]?.toLowerCase();
-    return name === 'resume' || name === 'model' || name === 'settings' || name === 'help' ? name : null;
+    return name === 'resume' ||
+      name === 'model' ||
+      name === 'settings' ||
+      name === 'help' ||
+      name === 'compact' ||
+      name === 'context'
+      ? name
+      : null;
   }
 
   /** Whether to respond to a non-@ message in a project group (免@ default on).
@@ -525,13 +565,13 @@ export function createOrchestrator(
   /** A turn's resolved permission, by sender role. `roleSuffix` is set only when
    * the project splits admin/guest tiers — then the session key is namespaced by
    * it so a guest never shares the admin thread (sandbox + codex history). */
-  type TurnPerm = { mode?: PermissionMode; network?: boolean; roleSuffix?: 'admin' | 'guest' };
+  type TurnPerm = { mode?: PermissionMode; network?: boolean; autoCompact?: boolean; roleSuffix?: 'admin' | 'guest' };
 
   /** Pick this sender's tier (admin vs guest) for `project`. */
   function turnPerm(project: Project | undefined, senderId: string): TurnPerm {
     if (!project) return {};
     const t = turnTier(project, isAdmin(cfg, senderId));
-    return { mode: t.mode, network: project.network, roleSuffix: t.split ? t.role : undefined };
+    return { mode: t.mode, network: project.network, autoCompact: project.autoCompact, roleSuffix: t.split ? t.role : undefined };
   }
 
   /** As {@link turnPerm}, plus the role-namespaced session key (only namespaced
@@ -683,6 +723,7 @@ export function createOrchestrator(
         const { thread: resolved, recreated } = await resolveThread(sessionKey, msg.chatId, {
           mode: perm.mode,
           network: perm.network,
+          autoCompact: perm.autoCompact,
         });
         let thread = resolved;
         const neverSeen = !thread;
@@ -697,7 +738,7 @@ export function createOrchestrator(
           // Unknown session (created before this bridge, or store lost): treat as
           // a fresh session bound to the resolved cwd.
           const cwd = project?.cwd ?? fallbackCwd;
-          thread = await backend.startThread({ cwd, mode: perm.mode, network: perm.network });
+          thread = await backend.startThread({ cwd, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
           sessions.set(sessionKey, thread);
           await upsertSession({
             threadId: sessionKey,
@@ -769,7 +810,7 @@ export function createOrchestrator(
   async function resolveThread(
     threadId: string,
     chatId: string,
-    perm?: { mode?: PermissionMode; network?: boolean },
+    perm?: { mode?: PermissionMode; network?: boolean; autoCompact?: boolean },
   ): Promise<{ thread: AgentThread | undefined; recreated: boolean }> {
     const live = sessions.get(threadId);
     if (live) return { thread: live, recreated: false };
@@ -783,6 +824,7 @@ export function createOrchestrator(
         effort: rec.effort,
         mode: perm?.mode,
         network: perm?.network,
+        autoCompact: perm?.autoCompact,
       });
       sessions.set(threadId, resumed);
       return { thread: resumed, recreated: false };
@@ -796,6 +838,7 @@ export function createOrchestrator(
         effort: rec.effort,
         mode: perm?.mode ?? project?.mode,
         network: perm?.network ?? project?.network,
+        autoCompact: perm?.autoCompact ?? project?.autoCompact,
       });
       sessions.set(threadId, fresh);
       // The resumed codex thread is gone — repoint the persisted record at the
@@ -847,7 +890,7 @@ export function createOrchestrator(
       const { model, effort } = pickDefault(await listModels());
       let thread: AgentThread;
       try {
-        thread = await backend.startThread({ cwd, model, effort, mode: perm.mode, network: perm.network });
+        thread = await backend.startThread({ cwd, model, effort, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
       } catch (err) {
         reaction.done();
         log.fail('card', err, { phase: 'start-topic' });
@@ -932,6 +975,113 @@ export function createOrchestrator(
     });
   }
 
+  /** `/context`: show the session's current context-window usage (always — even
+   * below the run card's threshold). Reads the last usage seen on this session;
+   * empty until the session has run at least one turn. */
+  async function postContextCard(msg: NormalizedMessage, sessionKey: string, inThread: boolean): Promise<void> {
+    const u = lastUsage.get(sessionKey);
+    await sendManagedCard(channel, msg.chatId, buildContextCard(u?.used ?? 0, u?.window ?? null), msg.messageId, inThread).catch(
+      (err) => log.fail('card', err, { phase: 'context' }),
+    );
+  }
+
+  /** Spinner cadence for the "压缩中" card. ~0.8s reads as live without spamming
+   * card updates (each is a round-trip). */
+  const COMPACT_ANIM_INTERVAL_MS = 800;
+
+  /** `/compact`: summarize the session's history to free context. Idle-only (a
+   * running turn owns the thread's single event stream); resumes the session
+   * under its current tier if it isn't live. Compaction is a background turn (not
+   * instant), so we post a managed "压缩中" card and flip it in place to
+   * 压缩完成/失败 once {@link AgentThread.compact} actually settles. */
+  async function runCompact(
+    msg: NormalizedMessage,
+    sessionKey: string,
+    inThread: boolean,
+    perm: TurnPerm,
+  ): Promise<void> {
+    const reply = (markdown: string): Promise<void> =>
+      channel
+        .send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: inThread })
+        .then(() => undefined, () => undefined);
+    if (active.get(sessionKey)) {
+      await reply('⏳ 这一轮还在跑，结束后再 `/compact`。');
+      return;
+    }
+    const { thread } = await resolveThread(sessionKey, msg.chatId, {
+      mode: perm.mode,
+      network: perm.network,
+      autoCompact: perm.autoCompact,
+    });
+    if (!thread) {
+      await reply('这个会话还没开始，先发条消息聊两句再 `/compact`。');
+      return;
+    }
+
+    // "压缩中" card we flip in place to the result. Keep its messageId so the
+    // settle step can update the same entity; fall back to a fresh card if the
+    // initial send (or the in-place update) fails.
+    let cardMsgId: string | undefined;
+    try {
+      const sent = await sendManagedCard(channel, msg.chatId, buildCompactingCard(0), msg.messageId, inThread);
+      cardMsgId = sent.messageId;
+    } catch (err) {
+      log.fail('card', err, { phase: 'compact-start-card' });
+    }
+
+    // Spin the "压缩中" card so it visibly keeps working (compaction can take a
+    // while). Self-rescheduling tick — never overlaps an in-flight update, and
+    // checks `stop` right before each render so no frame can clobber the result;
+    // the card has no buttons, so these updates can't hit an interaction lock.
+    let stop = false;
+    const wakers: Array<() => void> = [];
+    const sleep = (ms: number): Promise<void> =>
+      new Promise((res) => {
+        const t = setTimeout(res, ms);
+        wakers.push(() => {
+          clearTimeout(t);
+          res();
+        });
+      });
+    const anim = (async () => {
+      let tick = 0;
+      while (!stop && cardMsgId) {
+        await sleep(COMPACT_ANIM_INTERVAL_MS);
+        if (stop || !cardMsgId) break;
+        tick++;
+        await updateManagedCard(channel, cardMsgId, buildCompactingCard(tick)).catch(() => undefined);
+      }
+    })();
+
+    const settle = async (result: object): Promise<void> => {
+      stop = true;
+      wakers.forEach((w) => w()); // cut the current sleep so the result shows promptly
+      await anim; // let the in-flight frame finish so it can't land after the result
+      if (cardMsgId && (await updateManagedCard(channel, cardMsgId, result))) return;
+      await sendManagedCard(channel, msg.chatId, result, msg.messageId, inThread).catch((err) =>
+        log.fail('card', err, { phase: 'compact-settle' }),
+      );
+    };
+
+    // Pre-compaction occupancy, so the result card can show 旧% → 新%.
+    const before = lastUsage.get(sessionKey) ?? null;
+    try {
+      // Resolves only when codex's compaction turn truly finishes (compact()
+      // drains the stream to turn/completed), so the card flips at the right
+      // time AND no stale `done` leaks into the next turn.
+      const { usage } = await thread.compact();
+      if (usage) lastUsage.set(sessionKey, { used: usage.usedTokens, window: usage.contextWindow });
+      else lastUsage.delete(sessionKey); // refreshes on the next turn's usage event
+      log.info('intake', 'compact', { sessionKey, used: usage?.usedTokens ?? null, before: before?.used ?? null });
+      await settle(buildCompactedCard(usage, before));
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      const unsupported = /method not found|-32601|unknown (method|request)/i.test(m);
+      log.fail('intake', err, { phase: 'compact' });
+      await settle(buildCompactFailedCard(unsupported ? '当前 codex 版本不支持 /compact，请升级后再试。' : m));
+    }
+  }
+
   /** `/help`: post the command cheat-sheet for the caller's current scope. */
   async function postHelpCard(
     msg: NormalizedMessage,
@@ -983,14 +1133,19 @@ export function createOrchestrator(
   ): void => {
     const armedAt = Date.now();
     void (async () => {
-      await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
-      const card = typeof c === 'function' ? await c() : c;
-      const ok = await updateManagedCard(channel, msgId, card);
-      log.info('console', 'settle-update', { msgId, ok, waitedMs: Date.now() - armedAt, fallback: !ok && !!fallbackChatId });
-      if (!ok && fallbackChatId) {
-        await sendManagedCard(channel, fallbackChatId, card).catch((err) =>
-          log.fail('console', err, { phase: 'settle-fallback' }),
-        );
+      // Wrap the WHOLE flow: a throwing builder (`c()`), a rejected card update,
+      // or a rejected fallback must never die silently — that surfaces to the user
+      // as a dead button ("点击没反应") with nothing in the log to diagnose it.
+      try {
+        await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
+        const card = typeof c === 'function' ? await c() : c;
+        const ok = await updateManagedCard(channel, msgId, card);
+        log.info('console', 'settle-update', { msgId, ok, waitedMs: Date.now() - armedAt, fallback: !ok && !!fallbackChatId });
+        if (!ok && fallbackChatId) {
+          await sendManagedCard(channel, fallbackChatId, card);
+        }
+      } catch (err) {
+        log.fail('console', err, { phase: 'settle-update', msgId });
       }
     })();
   };
@@ -1464,6 +1619,24 @@ export function createOrchestrator(
       const n = Number(value.v);
       if (Number.isFinite(n)) applyPref(evt, (p) => (p.runIdleTimeoutSeconds = n));
     })
+    // 「自定义…」→ 打开输入卡（设置卡本身保持纯按钮、不会锁死）
+    .on(DM.watchdogCustom, ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      void patch(evt, buildWatchdogCustomCard(cfg));
+    })
+    // 保存自定义秒数：钳到 [MIN, MAX]（0=关闭）后写入，确保存的值即为生效值；
+    // applyPref 落盘并 patch 回设置卡，currentIdleMs() 下一轮立即读到新值。
+    .on(DM.watchdogCustomSubmit, ({ evt, formValue }) => {
+      const raw = String(formValue?.sec ?? '').trim();
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n < 0) {
+        void patch(evt, buildWatchdogCustomCard(cfg));
+        return;
+      }
+      const sec =
+        n === 0 ? 0 : Math.min(Math.max(Math.floor(n), RUN_IDLE_TIMEOUT_MIN_SEC), RUN_IDLE_TIMEOUT_MAX_SEC);
+      applyPref(evt, (p) => (p.runIdleTimeoutSeconds = sec));
+    })
     .on(DM.setPending, ({ evt, value }) => {
       if (value.v === 'steer' || value.v === 'queue') applyPref(evt, (p) => (p.pendingPolicy = value.v as PendingPolicy));
     })
@@ -1483,6 +1656,22 @@ export function createOrchestrator(
           return buildGroupSettingsCard({ ...project, noMention: on });
         }
         return buildGroupSettingsCard({ name: '本群', kind: 'multi', noMention: on });
+      });
+    })
+    .on(GS.setAutoCompact, ({ evt, value }) => {
+      if (!isAdmin(cfg, evt.operator?.openId ?? '')) return;
+      const on = value.v === 'on';
+      patch(evt, async () => {
+        const project = await getProjectByChatId(evt.chatId);
+        if (project) {
+          await updateProject(project.name, { autoCompact: on });
+          // The auto-compact limit is bound at thread/start, so evict live threads
+          // to rebind under the new setting on the next message (like 🔐 权限).
+          await evictLiveSessionsForChat(project.chatId);
+          log.info('console', 'group-autocompact', { project: project.name, on });
+          return buildGroupSettingsCard({ ...project, autoCompact: on });
+        }
+        return buildGroupSettingsCard({ name: '本群', kind: 'multi', autoCompact: on });
       });
     })
     // ── 权限管理回调（admins 全局 / 项目响应白名单）。均 dmAdmin 门控（私聊管理台）。
@@ -1589,6 +1778,16 @@ export function createOrchestrator(
         return p ? buildProjectSettingsCard(p) : buildDmMenuCard();
       });
     })
+    .on(DM.projectTopics, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const name = typeof value.n === 'string' ? value.n : '';
+      patch(evt, async () => {
+        const p = await getProjectByName(name);
+        if (!p) return buildDmMenuCard();
+        const sessions = (await listSessions()).filter((s) => s.chatId === p.chatId);
+        return buildProjectTopicsCard(p, sessions);
+      });
+    })
     .on(DM.setNoMentionDm, ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const name = typeof value.n === 'string' ? value.n : '';
@@ -1598,6 +1797,21 @@ export function createOrchestrator(
         if (!p) return buildDmMenuCard();
         await updateProject(name, { noMention: on });
         return buildProjectSettingsCard({ ...p, noMention: on });
+      });
+    })
+    .on(DM.setAutoCompactDm, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const name = typeof value.n === 'string' ? value.n : '';
+      const on = value.v === 'on';
+      patch(evt, async () => {
+        const p = await getProjectByName(name);
+        if (!p) return buildDmMenuCard();
+        await updateProject(name, { autoCompact: on });
+        // The auto-compact limit is bound at thread/start, so evict live threads
+        // to rebind under the new setting on the next message (mirrors 群设置).
+        await evictLiveSessionsForChat(p.chatId);
+        log.info('console', 'project-autocompact', { project: name, on });
+        return buildProjectSettingsCard({ ...p, autoCompact: on });
       });
     })
     // 🔐 权限：打开下拉表单子卡（管理员档 + 普通用户档 + 联网，选完提交）。
@@ -1859,6 +2073,7 @@ export function createOrchestrator(
           interrupted = true;
           resolveStop();
         };
+        const idleMs = currentIdleMs();
         const guarded = withIdleTimeout(
           run.events,
           idleMs,
@@ -1886,6 +2101,18 @@ export function createOrchestrator(
           }
           lastEvAt = tEv;
           evCount++;
+          // Track context usage for /context, and surface an auto-compact notice.
+          if (et === 'context_usage' && topicThreadId) {
+            const cu = ev as { usedTokens: number; contextWindow: number | null };
+            lastUsage.set(topicThreadId, { used: cu.usedTokens, window: cu.contextWindow });
+          } else if (et === 'context_compacted') {
+            // Only genuine auto-compaction reaches the turn loop — a manual
+            // /compact drains its own events in runCompact, so this is always an
+            // auto-compaction → post the special notice (non-blocking).
+            void sendManagedCard(channel, opts.chatId, buildAutoCompactCard(), cardMsgId, !opts.flat).catch((err) =>
+              log.fail('card', err, { phase: 'auto-compact-notice' }),
+            );
+          }
           render.apply(ev);
           rc.rs = render.snapshot();
           // Non-blocking: never stall event consumption on a round-trip. The pump
@@ -1897,7 +2124,7 @@ export function createOrchestrator(
         await stream.drain(); // flush the last coalesced frame before terminal
         state.interrupt = undefined; // turn done; nothing left to interrupt
         const killed = interrupted || timedOut;
-        if (timedOut) render.timeout(Math.max(1, Math.round(idleMs / 60_000)));
+        if (timedOut) render.timeout(Math.round(idleMs / 1000));
         else if (interrupted) render.interrupt();
         else render.finalize();
         rc.rs = render.snapshot();
@@ -2042,7 +2269,7 @@ export function createOrchestrator(
 
             let state: RunState = initialState;
             let timedOut = false;
-            const guarded = withIdleTimeout(run.events, idleMs, () => {
+            const guarded = withIdleTimeout(run.events, currentIdleMs(), () => {
               timedOut = true;
             });
             for await (const ev of guarded) state = reduce(state, ev);
