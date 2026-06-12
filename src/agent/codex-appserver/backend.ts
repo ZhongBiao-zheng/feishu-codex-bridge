@@ -17,6 +17,7 @@ import type {
   ThreadSummary,
   TurnOptions,
 } from '../types';
+import { isGoalTerminal } from '../types';
 import { AppServerClient } from './app-server-client';
 import { mapNotification } from './event-map';
 import { codexVersion, resolveCodexBin } from './locate';
@@ -202,6 +203,96 @@ class CodexThread implements AgentThread {
       }
     }
     return { events: gen(), turnId: () => self.currentTurnId };
+  }
+
+  runGoal(objective: string): AgentRun {
+    const self = this;
+    this.currentTurnId = undefined;
+    async function* gen(): AsyncGenerator<AgentEvent> {
+      // Clear any leftover goal on this thread FIRST. codex keeps a goal attached
+      // even after it completes and re-broadcasts it on every resume (verified);
+      // worse, a thread/goal/set whose objective is IDENTICAL to an already-complete
+      // goal is a NO-OP — so re-running the same goal would do nothing and report
+      // stale stats. And a leftover ACTIVE goal (from a crashed/killed run, or
+      // pre-fix dirty data) auto-continues on resume. runGoal only runs when STARTING
+      // a fresh goal (a busy session is gated out upstream), so any goal currently on
+      // the thread is leftover — clearing it guarantees the set below makes a fresh,
+      // actually-running goal and self-heals every leftover case.
+      await self.client.request('thread/goal/clear', { threadId: self.codexThreadId }).catch(() => undefined);
+
+      // thread/goal/set registers the goal AND auto-starts the first turn (codex
+      // idle-continuation) — verified on 0.139, so we never call turn/start; codex
+      // drives every turn. Race the set rejection so a disabled-feature / bad-param
+      // error surfaces instead of hanging (mirrors runStreamed's start-race).
+      let setError: Error | undefined;
+      const setFailed: Promise<'set-failed'> = new Promise((resolve) => {
+        self.client
+          .request('thread/goal/set', { threadId: self.codexThreadId, objective })
+          .then(undefined, (err: unknown) => {
+            setError = err instanceof Error ? err : new Error(String(err));
+            log.fail('agent', setError, { phase: 'thread/goal/set' });
+            resolve('set-failed');
+          });
+      });
+
+      const stream = self.client.stream()[Symbol.asyncIterator]();
+      // Guard against a STALE goal snapshot: resuming a thread that had a prior
+      // goal re-emits a thread/goal/updated for THAT goal (often already complete)
+      // around resume time — before ours runs. If we honored it we'd "complete"
+      // instantly with the old goal's stats and never do the work. So: ignore
+      // goal_updates whose objective isn't ours, and don't honor a terminal status
+      // until our goal has actually started (a turn started, or it went active).
+      let armed = false;
+      let turnActive = false;
+      let goalDone = false; // a terminal goal status was seen; drain the live turn, then stop
+      while (true) {
+        const step = await Promise.race([stream.next(), setFailed]);
+        if (step === 'set-failed') {
+          yield { type: 'error', message: setError?.message ?? 'thread/goal/set 请求失败', willRetry: false };
+          return;
+        }
+        if (step.done) return;
+        const ev = mapNotification(step.value);
+        if (!ev) continue;
+        if (ev.type === 'turn_started') {
+          self.currentTurnId = ev.turnId;
+          armed = true; // a real turn for our goal is running
+          turnActive = true;
+          yield ev;
+          continue;
+        }
+        if (ev.type === 'done') {
+          turnActive = false;
+          yield ev;
+          // The goal is terminal AND its final turn just finished — now stop.
+          if (goalDone) return;
+          continue;
+        }
+        if (ev.type === 'goal_update') {
+          if (ev.objective !== objective) continue; // stale snapshot for a different goal
+          if (ev.status === 'active' || ev.status === 'paused') armed = true;
+          yield ev;
+          // A goal spans many auto-continued turns — a per-turn `done` is NOT the
+          // end. On a terminal goal status: codex emits update_goal(complete) BEFORE
+          // the model's closing answer (verified — the final agentMessage arrives a
+          // couple seconds AFTER goal/complete), so returning here would cut the
+          // result off. If a turn is in flight, keep consuming until its turn/completed
+          // so the final answer renders; otherwise stop now.
+          if (armed && isGoalTerminal(ev.status)) {
+            if (turnActive) goalDone = true;
+            else return;
+          }
+          continue;
+        }
+        yield ev;
+        if (ev.type === 'error' && !ev.willRetry) return; // a fatal error kills the run
+      }
+    }
+    return { events: gen(), turnId: () => self.currentTurnId };
+  }
+
+  async clearGoal(): Promise<void> {
+    await this.client.request('thread/goal/clear', { threadId: this.codexThreadId });
   }
 
   async steer(input: AgentInput, expectedTurnId: string): Promise<void> {
